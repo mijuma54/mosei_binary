@@ -61,7 +61,7 @@ def run_snuba(hg, ht,  n = 1, idx = None, min_cardinality = 1, max_cardinality =
 
 
 def load_data():
-    with open('data/mosei_X_bag_r0.1_seed1234.pkl', 'rb') as f:
+    with open('data/mosei_X_stem_bag_r0.1_seed1234.pkl', 'rb') as f:
         X = pickle.load(f)
     with open('data/mosei_y.pkl', 'rb') as f:
         y = pickle.load(f)
@@ -69,14 +69,20 @@ def load_data():
     with open('data/mosei_X_wordvector.pkl', 'rb') as f:
         X2 = pickle.load(f)
 
-
+    glove_max = 0
+    for r in X2:
+        glove_max = max(glove_max, np.max(r))
+    glove_min = 0
+    for r in X2:
+        glove_min = min(glove_min, np.min(r))
+    glove_normal_factor = glove_max - glove_min
 
     new_X = np.zeros((len(X), X.shape[1] + 900))
     for i in range(len(X)):
         new_X[i][:X.shape[1]] = X[i]
-        new_X[i][X.shape[1]:X.shape[1]+300] = np.mean(X2[i], axis=0)/8.3346
-        new_X[i][X.shape[1]+300:X.shape[1] + 600] = np.max(X2[i], axis=0)/8.3346
-        new_X[i][X.shape[1]+600:X.shape[1] + 900] = np.min(X2[i], axis=0)/8.3346
+        new_X[i][X.shape[1]:X.shape[1]+300] = np.mean(X2[i], axis=0)/glove_normal_factor
+        new_X[i][X.shape[1]+300:X.shape[1] + 600] = np.max(X2[i], axis=0)/glove_normal_factor
+        new_X[i][X.shape[1]+600:X.shape[1] + 900] = np.min(X2[i], axis=0)/glove_normal_factor
     return np.array(new_X), np.array(y)
 
 def main():
@@ -114,12 +120,12 @@ def main():
     training_marginalss = []
     timess = []
     hgs = dict()
-    for ht in ['nn', 'dt', 'lr']: #
+    for ht in ['nn','dt', 'lr']: #
 
 
         for c in range(1, 11):
             exp_name = f'{current_date_time}_{ht}_c{c}'
-            writer = None#SummaryWriter(f'tensorboard_logs/{exp_name}')
+            writer = SummaryWriter(f'tensorboard_logs/{exp_name}')
 
             hgs[ht] = []
             for j in range(6):

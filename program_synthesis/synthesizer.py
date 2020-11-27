@@ -1,5 +1,4 @@
 import numpy as np
-import random
 
 from sklearn.metrics import f1_score
 from sklearn.linear_model import LogisticRegression
@@ -7,44 +6,74 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.neighbors import KNeighborsClassifier
 import multiprocessing as mp
 import concurrent.futures as cf
+import parmap
+import cupy as cp
 
 def random_combination(m, n, k): #m combinations from nCk
     out = []
-
+    check = dict()
     while len(out) < 1000:#m:
-        temp = random.sample(range(n), k)
-        if temp not in out:
-            out.append(temp)
+        temp = np.random.choice(range(n), k, replace=False)
+        if str(temp) not in check:
+            out.append(np.array(temp))
+            check[str(temp)] = 0
     return out
 
-@profile
+
+def all_pair_dist2_cuda(X1, X2, feat):
+    n1 = len(X1)
+    n2 = len(X2)
+    nf = len(feat)
+    feat = cp.array(feat)
+    X1 = cp.array(X1.reshape(1, n1, -1))
+    X2 = cp.array(X2.reshape(1, n2, -1))
+
+    mat1 = cp.repeat(X1, n2, axis=0)
+    mat2 = cp.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
+
+    isbow = cp.repeat(cp.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
+
+    count_mat = nf - cp.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
+    zeros = (count_mat != 0)
+    #count_mat[zeros] = 1
+
+    dist_mat = np.ones_like(count_mat)
+    dist_mat[zeros] = np.sum(np.abs(mat1 - mat2), axis=2)[zeros] / count_mat[zeros]
+    #dist_mat[zeros] = 1
+
+    return dist_mat
+
 def all_pair_dist2(X1, X2, feat):
     n1 = len(X1)
     n2 = len(X2)
     nf = len(feat)
     feat = np.array(feat)
-    X1 = X1.reshape(1, n1, -1)
-    X2 = X2.reshape(1, n2, -1)
+    X1 = np.array(X1.reshape(1, n1, -1))
+    X2 = np.array(X2.reshape(1, n2, -1))
 
     mat1 = np.repeat(X1, n2, axis=0)
     mat2 = np.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
 
-    isbow = np.repeat(np.repeat((feat < 2317).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
+    isbow = np.repeat(np.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
 
     count_mat = nf - np.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
-    zeros = np.where(count_mat == 0)
-    count_mat[zeros] = 1
+    zeros = (count_mat != 0)
+    #count_mat[zeros] = 1
 
-    dist_mat = np.sum(np.abs(mat1 - mat2), axis=2) / count_mat
-    dist_mat[zeros] = 1
+    dist_mat = np.ones_like(count_mat)
+    dist_mat[zeros] = np.sum(np.abs(mat1 - mat2), axis=2)[zeros] / count_mat[zeros]
+    #dist_mat[zeros] = 1
 
     return dist_mat
+
 
 
 class dummyKneighborClassifier(object):
     def __init__(self, n):
         self.n = n
     def predict_proba(self, dist_mat, val_ground):
+        dist_mat = np.array(dist_mat)
+        val_ground = np.array(val_ground)
 
         neigh_ground = val_ground[np.argsort(dist_mat, axis=1)[:, -self.n:]]
         marginals = np.ones((dist_mat.shape[0], 2))
@@ -117,7 +146,7 @@ class Synthesizer(object):
     def fit_and_return(self, comb, model):
         return self.fit_function(comb, model)
 
-    @profile
+    #@profile
     def generate_heuristics(self, model,min_cardinality=1, max_cardinality=1):
         """
         Generates heuristics over given feature cardinality
@@ -131,16 +160,22 @@ class Synthesizer(object):
         feature_length = 0
         for cardinality in range(min_cardinality, max_cardinality + 1):
             feature_combinations = self.generate_feature_combinations(cardinality)
+            #######single-core
+            # heuristics = []
+            # for i, comb in enumerate(feature_combinations):
+            #     heuristics.append(self.fit_function(comb, model))
 
-            heuristics = []
-            for i, comb in enumerate(feature_combinations):
-                heuristics.append(self.fit_function(comb, model))
-
+            ##########with future
             # with cf.ThreadPoolExecutor(max_workers=8) as exe:
             #     future_to_comb = {exe.submit(self.fit_and_return, comb, model): comb for comb in feature_combinations}
             #     for future in cf.as_completed(future_to_comb):
             #         #comb = future_to_comb[future]
             #         heuristics.append(future.result())
+
+
+            #########with parmap
+            heuristics = parmap.map(self.fit_and_return, feature_combinations, model, pm_pbar=True)
+
 
             feature_combinations_final.append(feature_combinations)
             heuristics_final.append(heuristics)
@@ -170,17 +205,17 @@ class Synthesizer(object):
         return beta_params[np.argsort(np.array(f1))[-1]]
 
 
-    def find_dist_and_proba_and_beta(self, hf, X, feat, ground):
+    def find_dist_and_proba_and_beta(self, hf, feat, X,  ground):
         X_ = all_pair_dist2(self.val_primitive_matrix[:, feat], X[:, feat], feat)
         marginals = hf.predict_proba(X_, self.val_ground)[:, 1]
         return self.beta_optimizer(marginals, ground)
 
-    def find_proba_and_beta(self, hf, X, feat, ground):
+    def find_proba_and_beta(self, hf, feat, X, ground):
         marginals = hf.predict_proba(X[:, feat])[:, 1]
         return self.beta_optimizer(marginals, ground)
 
-    @profile
-    def find_optimal_beta(self, heuristics, X, feat_combos, ground):
+    #@profile
+    def find_optimal_beta(self, heuristics,  X, feat_combos, ground):
         """
         Returns optimal beta for given heuristics
         heuristics: list of pre-trained logistic regression models
@@ -193,7 +228,7 @@ class Synthesizer(object):
         #
         # if f'{heuristics[0].__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
         #     with cf.ThreadPoolExecutor(max_workers=8) as exe:
-        #         future_to_index = {exe.submit(self.find_dist_and_proba_and_beta, i[1], X, feat_combos[i[0]], ground): i[0]
+        #         future_to_index = {exe.submit(self.find_dist_and_proba_and_beta, i[1], feat_combos[i[0]], X, ground): i[0]
         #                            for i in enumerate(heuristics)}
         #         for future in cf.as_completed(future_to_index):
         #             i = future_to_index[future]
@@ -207,14 +242,16 @@ class Synthesizer(object):
         #             i = future_to_index[future]
         #             beta_opt[i] = future.result()
 
-        beta_opt = []
-        for i, hf in enumerate(heuristics):
-            if f'{heuristics[0].__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
+        if f'{heuristics[0].__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
+            ########single-core
+            beta_opt = []
+            for i, hf in enumerate(heuristics):
                 X_ = all_pair_dist2(self.val_primitive_matrix[:, feat_combos[i]], X[:, feat_combos[i]], feat_combos[i])
                 marginals = hf.predict_proba(X_, self.val_ground)[:, 1]
-            else:
-                marginals = hf.predict_proba(X[:, feat_combos[i]])[:, 1]
-            beta_opt.append((self.beta_optimizer(marginals, ground)))
+                beta_opt.append((self.beta_optimizer(marginals, ground)))
 
+        else:
+            #######with parmap
+            beta_opt = parmap.starmap(self.find_proba_and_beta, list(zip(heuristics, feat_combos)), X, ground, pm_pbar=True)
 
         return beta_opt

@@ -5,6 +5,8 @@ import pandas as pd
 from program_synthesis.synthesizer import Synthesizer
 from program_synthesis.verifier import Verifier
 import concurrent.futures as cf
+import parmap
+import cupy as cp
 
 def f1_score(ground, pred):
     ground = ground.reshape(-1)
@@ -21,27 +23,58 @@ def f1_score(ground, pred):
     else:
         return 2*precision*recall/(precision+recall)
 
-@profile
+#@profile
 def all_pair_dist(X1, X2, feat):
     n1 = len(X1)
     n2 = len(X2)
     nf = len(feat)
-    feat = np.array(feat)
-    X1 = X1.reshape(1, n1, -1)
-    X2 = X2.reshape(1, n2, -1)
+    feat = cp.array(feat)
+    X1 = cp.array(X1.reshape(1, n1, -1))
+    X2 = cp.array(X2.reshape(1, n2, -1))
 
-    mat1 = np.repeat(X1, n2, axis=0)
-    mat2 = np.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
+    mat1 = cp.repeat(X1, n2, axis=0)
+    mat2 = cp.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
 
-    isbow = np.repeat(np.repeat((feat < 2317).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
-    count_mat = nf - np.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
-    zeros = np.where(count_mat == 0)
+    isbow = cp.repeat(cp.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
+    count_mat = nf - cp.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
+    zeros = cp.where(count_mat == 0)
     count_mat[zeros] = 1
 
-    dist_mat = np.sum(np.abs(mat1 - mat2), axis=2) / count_mat
+    dist_mat = cp.sum(np.abs(mat1 - mat2), axis=2) / count_mat
     dist_mat[zeros] = 1
 
-    return dist_mat
+    return cp.asnumpy(dist_mat)
+
+def marginals_to_labels(hf, beta, feat, X, hg):
+    if f'{hf.__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
+        if hg.feedback_idx is not None:
+            X_ = all_pair_dist(hg.val_primitive_matrix[:, feat][hg.feedback_idx], X, feat)
+        else:
+            X_ = all_pair_dist(hg.val_primitive_matrix[:, feat], X, feat)
+        marginals = hf.predict_proba(X_, hg.val_ground)[:, 1]
+    else:
+        marginals = hf.predict_proba(X)[:, 1]
+
+    labels_cutoff = np.zeros(np.shape(marginals))
+    labels_cutoff[marginals <= (hg.b - beta)] = -1.
+    labels_cutoff[marginals >= (hg.b + beta)] = 1.
+    return labels_cutoff
+
+def marginals_to_labels2(hf, beta, feat, X, hg):
+    X = X[:, feat]
+    if f'{hf.__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
+        if hg.feedback_idx is not None:
+            X_ = all_pair_dist(hg.val_primitive_matrix[:, feat][hg.feedback_idx], X, feat)
+        else:
+            X_ = all_pair_dist(hg.val_primitive_matrix[:, feat], X, feat)
+        marginals = hf.predict_proba(X_, hg.val_ground)[:, 1]
+    else:
+        marginals = hf.predict_proba(X)[:, 1]
+
+    labels_cutoff = np.zeros(np.shape(marginals))
+    labels_cutoff[marginals <= (hg.b - beta)] = -1.
+    labels_cutoff[marginals >= (hg.b + beta)] = 1.
+    return labels_cutoff
 
 
 class HeuristicGenerator(object):
@@ -69,7 +102,7 @@ class HeuristicGenerator(object):
         self.hf = []
         self.feat_combos = []
         self.feedback_idx = None
-    @profile
+    #@profile
     def apply_heuristics(self, heuristics, primitive_matrix, feat_combos, beta_opt):
         """
         Apply given heuristics to given feature matrix X and abstain by beta
@@ -78,35 +111,29 @@ class HeuristicGenerator(object):
         beta: best beta value for associated heuristics
         """
 
-        def marginals_to_labels(hf, X, beta, feat):
 
-            if f'{hf.__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
-                if self.feedback_idx is not None:
-                    X_ = all_pair_dist(self.val_primitive_matrix[:, feat][self.feedback_idx], X, feat)
-                else:
-                    X_ = all_pair_dist(self.val_primitive_matrix[:, feat], X, feat)
-                marginals = hf.predict_proba(X_, self.val_ground)[:, 1]
-            else:
-                marginals = hf.predict_proba(X)[:, 1]
+        if f'{heuristics[0].__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
+            #########single-core
+            L = np.zeros((np.shape(primitive_matrix)[0], len(heuristics)))
+            for i, hf in enumerate(heuristics):
+                L[:, i] = marginals_to_labels(hf, beta_opt[i],  feat_combos[i], primitive_matrix[:, feat_combos[i]],  self)
+            return L
 
-            labels_cutoff = np.zeros(np.shape(marginals))
-            labels_cutoff[marginals <= (self.b - beta)] = -1.
-            labels_cutoff[marginals >= (self.b + beta)] = 1.
-            return labels_cutoff
-
-        L = np.zeros((np.shape(primitive_matrix)[0], len(heuristics)))
-        for i, hf in enumerate(heuristics):
-            L[:, i] = marginals_to_labels(hf, primitive_matrix[:, feat_combos[i]], beta_opt[i], feat_combos[i])
-
+        ########using future
         # with cf.ThreadPoolExecutor(max_workers=8) as exe:
         #     future_to_index = {exe.submit(marginals_to_labels, i[1], primitive_matrix[:, feat_combos[i[0]]], beta_opt[i[0]], feat_combos[i[0]]): i[0]
         #                        for i in enumerate(heuristics)}
         #     for future in cf.as_completed(future_to_index):
         #         i = future_to_index[future]
         #         L[:, i] = future.result()
-        return L
 
-    @profile
+        else:
+        ########using parmap
+            L_ = parmap.starmap(marginals_to_labels2, list(zip(heuristics, beta_opt, feat_combos)), primitive_matrix, self, pm_pbar=True)
+
+            return np.transpose(np.array(L_))
+
+    #@profile
     def prune_heuristics(self, heuristics, feat_combos, keep=1):
         """
         Selects the best heuristic based on Jaccard Distance and Reliability Metric
@@ -158,7 +185,7 @@ class HeuristicGenerator(object):
         sort_idx = np.argsort(combined_scores)[::-1][0:keep]
         return sort_idx
 
-    @profile
+    #@profile
     def run_synthesizer(self, min_cardinality=1, max_cardinality=1, idx=None, keep=1, model='lr'):
         """
         Generates Synthesizer object and saves all generated heuristics
@@ -203,7 +230,7 @@ class HeuristicGenerator(object):
         self.L_val = self.apply_heuristics(self.hf, self.val_primitive_matrix, self.feat_combos, beta_opt)
         self.L_train = self.apply_heuristics(self.hf, self.train_primitive_matrix, self.feat_combos, beta_opt)
 
-    @profile
+    #@profile
     def run_verifier(self):
         """
         Generates Verifier object and saves marginals
