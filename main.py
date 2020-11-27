@@ -113,7 +113,7 @@ def main():
                 val_ys[j-1][i] = -1
 
 
-
+    cuda = False
     precisions = []
     recalls = []
     coverages = []
@@ -129,7 +129,7 @@ def main():
 
             hgs[ht] = []
             for j in range(6):
-                hgs[ht].append(HeuristicGenerator(train_X, val_X, val_ys[j], train_ys[j]))
+                hgs[ht].append(HeuristicGenerator(train_X, val_X, val_ys[j], train_ys[j], cuda=cuda))
 
 
 

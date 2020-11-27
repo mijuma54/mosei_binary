@@ -47,13 +47,15 @@ def all_pair_dist_cuda(X1, X2, feat):
 
 def all_pair_dist_cuda(X1, X2, feat, metric='cosine'):
     if metric=='cosine':
+        X1 = cp.array(X1)
+        X2 = cp.array(X2)
         norm1 = cp.einsum('ij, ij->i', X1, X1)
         norm1 = cp.sqrt(norm1, norm1).reshape(-1, 1)
 
         norm2 = cp.einsum('ij, ij->i', X2, X2)
         norm2 = cp.sqrt(norm2, norm2).reshape(-1, 1)
 
-        return cp.dot(X2/norm2, (X1/norm1).T)
+        return cp.asnumpy(cp.dot(X2/norm2, (X1/norm1).T))
     else:
         n1 = len(X1)
         n2 = len(X2)
@@ -101,23 +103,21 @@ def all_pair_dist(X1, X2, feat, metric='cosine'):
         return dist_mat
 
 
-
-def marginals_to_labels(hf, beta, feat, X, hg):
-    if f'{hf.__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
-        if hg.feedback_idx is not None:
-            X_ = all_pair_dist(hg.val_primitive_matrix[:, feat][hg.feedback_idx], X, feat)
-        else:
-            X_ = all_pair_dist(hg.val_primitive_matrix[:, feat], X, feat)
-        marginals = hf.predict_proba(X_, hg.val_ground)[:, 1]
+def marginals_to_labels_cuda(hf, beta, feat, X, hg):
+    if hg.feedback_idx is not None:
+        X_ = all_pair_dist_cuda(hg.val_primitive_matrix[:, feat][hg.feedback_idx], X, feat)
     else:
-        marginals = hf.predict_proba(X)[:, 1]
+        X_ = all_pair_dist_cuda(hg.val_primitive_matrix[:, feat], X, feat)
 
-    labels_cutoff = np.zeros(np.shape(marginals))
+    marginals = cp.array(hf.predict_proba(X_, hg.val_ground)[:, 1])
+
+    labels_cutoff = cp.zeros(np.shape(marginals))
     labels_cutoff[marginals <= (hg.b - beta)] = -1.
     labels_cutoff[marginals >= (hg.b + beta)] = 1.
-    return labels_cutoff
+    return cp.asnumpy(labels_cutoff)
 
-def marginals_to_labels2(hf, beta, feat, X, hg):
+#use feat inplace
+def marginals_to_labels(hf, beta, feat, X, hg):
     X = X[:, feat]
     if f'{hf.__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
         if hg.feedback_idx is not None:
@@ -140,7 +140,7 @@ class HeuristicGenerator(object):
     """
 
     def __init__(self, train_primitive_matrix, val_primitive_matrix,
-                 val_ground, train_ground=None, b=0.5):
+                 val_ground, train_ground=None, b=0.5, cuda=False):
         """
         Initialize HeuristicGenerator object
         b: class prior of most likely class (TODO: use somewhere)
@@ -153,6 +153,7 @@ class HeuristicGenerator(object):
         self.val_ground = val_ground
         self.train_ground = train_ground
         self.b = b
+        self.cuda=cuda
 
         self.vf = None
         self.syn = None
@@ -170,16 +171,20 @@ class HeuristicGenerator(object):
 
 
         if f'{heuristics[0].__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
-            #########single-core
-            L = np.zeros((np.shape(primitive_matrix)[0], len(heuristics)))
-            for i, hf in enumerate(heuristics):
-                L[:, i] = marginals_to_labels(hf, beta_opt[i],  feat_combos[i], primitive_matrix[:, feat_combos[i]],  self)
-            return L
-
+            if self.cuda:
+                #########gpu
+                L = np.zeros((np.shape(primitive_matrix)[0], len(heuristics)))
+                for i, hf in enumerate(heuristics):
+                    L[:, i] = marginals_to_labels_cuda(hf, beta_opt[i],  feat_combos[i], primitive_matrix[:, feat_combos[i]], self)
+                return L
+            else:
+                ########using parmap
+                L_ = parmap.starmap(marginals_to_labels, list(zip(heuristics, beta_opt, feat_combos)),
+                                    primitive_matrix, self, pm_pbar=True)
 
         else:
         ########using parmap
-            L_ = parmap.starmap(marginals_to_labels2, list(zip(heuristics, beta_opt, feat_combos)), primitive_matrix, self, pm_pbar=True)
+            L_ = parmap.starmap(marginals_to_labels, list(zip(heuristics, beta_opt, feat_combos)), primitive_matrix, self, pm_pbar=True)
 
             return np.transpose(np.array(L_))
 
@@ -252,7 +257,7 @@ class HeuristicGenerator(object):
             ground = self.val_ground[idx]
         self.idx = idx
         # Generate all possible heuristics
-        self.syn = Synthesizer(primitive_matrix, ground, b=self.b)
+        self.syn = Synthesizer(primitive_matrix, ground, b=self.b, cuda=self.cuda)
 
         # Un-flatten indices
         def index(a, inp):

@@ -16,7 +16,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 def random_combination(m, n, k): #m combinations from nCk
     out = []
     check = dict()
-    while len(out) < 100:#m:
+    while len(out) < 10:#m:
         temp = np.random.choice(range(n), k, replace=False)
         if str(temp) not in check:
             out.append(np.array(temp))
@@ -26,13 +26,15 @@ def random_combination(m, n, k): #m combinations from nCk
 
 def all_pair_dist_cuda(X1, X2, feat, metric='cosine'):
     if metric=='cosine':
+        X1 = cp.array(X1)
+        X2 = cp.array(X2)
         norm1 = cp.einsum('ij, ij->i', X1, X1)
         norm1 = cp.sqrt(norm1, norm1).reshape(-1, 1)
 
         norm2 = cp.einsum('ij, ij->i', X2, X2)
         norm2 = cp.sqrt(norm2, norm2).reshape(-1, 1)
 
-        return cp.dot(X2/norm2, (X1/norm1).T)
+        return cp.asnumpy(cp.dot(X2/norm2, (X1/norm1).T))
     else:
         n1 = len(X1)
         n2 = len(X2)
@@ -121,7 +123,7 @@ class Synthesizer(object):
     A class to synthesize heuristics from primitives and validation labels
     """
 
-    def __init__(self, primitive_matrix, val_ground, b=0.5):
+    def __init__(self, primitive_matrix, val_ground, b=0.5, cuda=False):
         """
         Initialize Synthesizer object
         b: class prior of most likely class
@@ -131,6 +133,7 @@ class Synthesizer(object):
         self.val_ground = val_ground
         self.p = np.shape(self.val_primitive_matrix)[1]
         self.b = b
+        self.cuda = cuda
 
     def generate_feature_combinations(self, cardinality=1):
         """
@@ -253,13 +256,17 @@ class Synthesizer(object):
 
 
         if f'{heuristics[0].__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
-            ########single-core
-            beta_opt = []
-            for i, hf in enumerate(heuristics):
-                X_ = all_pair_dist(self.val_primitive_matrix[:, feat_combos[i]], X[:, feat_combos[i]], feat_combos[i])
-                marginals = hf.predict_proba(X_, self.val_ground)[:, 1]
-                beta_opt.append((self.beta_optimizer(marginals, ground)))
-
+            ########single-core, gpu
+            if self.cuda:
+                beta_opt = []
+                for i, hf in enumerate(heuristics):
+                    X_ = all_pair_dist_cuda(self.val_primitive_matrix[:, feat_combos[i]], X[:, feat_combos[i]], feat_combos[i])
+                    marginals = hf.predict_proba(X_, self.val_ground)[:, 1]
+                    beta_opt.append((self.beta_optimizer(marginals, ground)))
+            else:
+                #######with parmap
+                beta_opt = parmap.starmap(self.find_dist_and_proba_and_beta, list(zip(heuristics, feat_combos)), X, ground,
+                                          pm_pbar=True)
         else:
             #######with parmap
             beta_opt = parmap.starmap(self.find_proba_and_beta, list(zip(heuristics, feat_combos)), X, ground, pm_pbar=True)
