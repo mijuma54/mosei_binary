@@ -8,11 +8,15 @@ import multiprocessing as mp
 import concurrent.futures as cf
 import parmap
 import cupy as cp
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+
 
 def random_combination(m, n, k): #m combinations from nCk
     out = []
     check = dict()
-    while len(out) < 1000:#m:
+    while len(out) < 100:#m:
         temp = np.random.choice(range(n), k, replace=False)
         if str(temp) not in check:
             out.append(np.array(temp))
@@ -20,65 +24,94 @@ def random_combination(m, n, k): #m combinations from nCk
     return out
 
 
-def all_pair_dist2_cuda(X1, X2, feat):
-    n1 = len(X1)
-    n2 = len(X2)
-    nf = len(feat)
-    feat = cp.array(feat)
-    X1 = cp.array(X1.reshape(1, n1, -1))
-    X2 = cp.array(X2.reshape(1, n2, -1))
+def all_pair_dist_cuda(X1, X2, feat, metric='cosine'):
+    if metric=='cosine':
+        norm1 = cp.einsum('ij, ij->i', X1, X1)
+        norm1 = cp.sqrt(norm1, norm1).reshape(-1, 1)
 
-    mat1 = cp.repeat(X1, n2, axis=0)
-    mat2 = cp.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
+        norm2 = cp.einsum('ij, ij->i', X2, X2)
+        norm2 = cp.sqrt(norm2, norm2).reshape(-1, 1)
 
-    isbow = cp.repeat(cp.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
+        return cp.dot(X2/norm2, (X1/norm1).T)
+    else:
+        n1 = len(X1)
+        n2 = len(X2)
+        nf = len(feat)
+        feat = cp.array(feat)
+        X1 = cp.array(X1.reshape(1, n1, -1))
+        X2 = cp.array(X2.reshape(1, n2, -1))
 
-    count_mat = nf - cp.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
-    zeros = (count_mat != 0)
-    #count_mat[zeros] = 1
+        mat1 = cp.repeat(X1, n2, axis=0)
+        mat2 = cp.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
 
-    dist_mat = np.ones_like(count_mat)
-    dist_mat[zeros] = np.sum(np.abs(mat1 - mat2), axis=2)[zeros] / count_mat[zeros]
-    #dist_mat[zeros] = 1
+        isbow = cp.repeat(cp.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
 
-    return dist_mat
+        count_mat = nf - cp.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
+        zeros = (count_mat != 0)
 
-def all_pair_dist2(X1, X2, feat):
-    n1 = len(X1)
-    n2 = len(X2)
-    nf = len(feat)
-    feat = np.array(feat)
-    X1 = np.array(X1.reshape(1, n1, -1))
-    X2 = np.array(X2.reshape(1, n2, -1))
+        dist_mat = cp.ones_like(count_mat)
+        dist_mat[zeros] = cp.sum(np.cbs(mat1 - mat2), axis=2)[zeros] / count_mat[zeros]
 
-    mat1 = np.repeat(X1, n2, axis=0)
-    mat2 = np.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
+        return cp.asnumpy(dist_mat)
 
-    isbow = np.repeat(np.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
 
-    count_mat = nf - np.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
-    zeros = (count_mat != 0)
-    #count_mat[zeros] = 1
+def all_pair_dist(X1, X2, feat, metric='cosine'):
+    if metric=='cosine':
+        return cosine_similarity(X2, X1)
+    else:
+        n1 = len(X1)
+        n2 = len(X2)
+        nf = len(feat)
+        feat = np.array(feat)
+        X1 = np.array(X1.reshape(1, n1, -1))
+        X2 = np.array(X2.reshape(1, n2, -1))
 
-    dist_mat = np.ones_like(count_mat)
-    dist_mat[zeros] = np.sum(np.abs(mat1 - mat2), axis=2)[zeros] / count_mat[zeros]
-    #dist_mat[zeros] = 1
+        mat1 = np.repeat(X1, n2, axis=0)
+        mat2 = np.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
 
-    return dist_mat
+        isbow = np.repeat(np.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
+
+        count_mat = nf - np.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
+        nonzeros = (count_mat != 0)
+
+        dist_mat = np.ones_like(count_mat)
+        dist_mat[nonzeros] = np.sum(np.abs(mat1 - mat2), axis=2)[nonzeros] / count_mat[nonzeros]
+
+        return dist_mat
 
 
 
 class dummyKneighborClassifier(object):
     def __init__(self, n):
         self.n = n
-    def predict_proba(self, dist_mat, val_ground):
-        dist_mat = np.array(dist_mat)
-        val_ground = np.array(val_ground)
 
-        neigh_ground = val_ground[np.argsort(dist_mat, axis=1)[:, -self.n:]]
+    def predict_proba_cuda(self, dist_mat, val_ground, metric='cosine'):
+
+        dist_mat = cp.array(dist_mat)
+        val_ground = cp.array(val_ground)
+        if metric == 'cosine':
+            neigh_ground = val_ground[cp.argsort(dist_mat, axis=1)[:, :self.n]]
+
+        else:
+            neigh_ground = val_ground[cp.argsort(dist_mat, axis=1)[:, -self.n:]]
+
+        marginals = cp.ones((dist_mat.shape[0], 2))
+        marginals[:, 1] = cp.sum(neigh_ground == 1, axis=1) / self.n
+        #marginals[:, 0] -= cp.sum(neigh_ground == 1, axis=1) / self.n
+
+
+        return cp.asnumpy(marginals)
+
+    def predict_proba(self, dist_mat, val_ground, metric='cosine'):
+        if metric=='cosine':
+            neigh_ground = val_ground[np.argsort(dist_mat, axis=1)[:, :self.n]]
+        else:
+
+
+            neigh_ground = val_ground[np.argsort(dist_mat, axis=1)[:, -self.n:]]
         marginals = np.ones((dist_mat.shape[0], 2))
         marginals[:, 1] = np.sum(neigh_ground == 1, axis=1) / self.n
-        marginals[:, 0] -= np.sum(neigh_ground == 1, axis=1) / self.n
+        #marginals[:, 0] -= np.sum(neigh_ground == 1, axis=1) / self.n
 
 
         return marginals
@@ -165,12 +198,6 @@ class Synthesizer(object):
             # for i, comb in enumerate(feature_combinations):
             #     heuristics.append(self.fit_function(comb, model))
 
-            ##########with future
-            # with cf.ThreadPoolExecutor(max_workers=8) as exe:
-            #     future_to_comb = {exe.submit(self.fit_and_return, comb, model): comb for comb in feature_combinations}
-            #     for future in cf.as_completed(future_to_comb):
-            #         #comb = future_to_comb[future]
-            #         heuristics.append(future.result())
 
 
             #########with parmap
@@ -206,7 +233,7 @@ class Synthesizer(object):
 
 
     def find_dist_and_proba_and_beta(self, hf, feat, X,  ground):
-        X_ = all_pair_dist2(self.val_primitive_matrix[:, feat], X[:, feat], feat)
+        X_ = all_pair_dist(self.val_primitive_matrix[:, feat], X[:, feat], feat)
         marginals = hf.predict_proba(X_, self.val_ground)[:, 1]
         return self.beta_optimizer(marginals, ground)
 
@@ -224,29 +251,12 @@ class Synthesizer(object):
         ground: ground truth associated with X data
         """
 
-        # beta_opt = np.zeros(len(heuristics))
-        #
-        # if f'{heuristics[0].__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
-        #     with cf.ThreadPoolExecutor(max_workers=8) as exe:
-        #         future_to_index = {exe.submit(self.find_dist_and_proba_and_beta, i[1], feat_combos[i[0]], X, ground): i[0]
-        #                            for i in enumerate(heuristics)}
-        #         for future in cf.as_completed(future_to_index):
-        #             i = future_to_index[future]
-        #             beta_opt[i] = future.result()
-        #
-        # else:
-        #     with cf.ThreadPoolExecutor(max_workers=8) as exe:
-        #         future_to_index = {exe.submit(self.find_proba_and_beta, i[1], X, feat_combos[i[0]]): i[0]
-        #                            for i in enumerate(heuristics)}
-        #         for future in cf.as_completed(future_to_index):
-        #             i = future_to_index[future]
-        #             beta_opt[i] = future.result()
 
         if f'{heuristics[0].__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
             ########single-core
             beta_opt = []
             for i, hf in enumerate(heuristics):
-                X_ = all_pair_dist2(self.val_primitive_matrix[:, feat_combos[i]], X[:, feat_combos[i]], feat_combos[i])
+                X_ = all_pair_dist(self.val_primitive_matrix[:, feat_combos[i]], X[:, feat_combos[i]], feat_combos[i])
                 marginals = hf.predict_proba(X_, self.val_ground)[:, 1]
                 beta_opt.append((self.beta_optimizer(marginals, ground)))
 

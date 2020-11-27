@@ -4,9 +4,9 @@ import pandas as pd
 
 from program_synthesis.synthesizer import Synthesizer
 from program_synthesis.verifier import Verifier
-import concurrent.futures as cf
 import parmap
 import cupy as cp
+from sklearn.metrics.pairwise import cosine_similarity
 
 def f1_score(ground, pred):
     ground = ground.reshape(-1)
@@ -24,7 +24,7 @@ def f1_score(ground, pred):
         return 2*precision*recall/(precision+recall)
 
 #@profile
-def all_pair_dist(X1, X2, feat):
+def all_pair_dist_cuda(X1, X2, feat):
     n1 = len(X1)
     n2 = len(X2)
     nf = len(feat)
@@ -44,6 +44,63 @@ def all_pair_dist(X1, X2, feat):
     dist_mat[zeros] = 1
 
     return cp.asnumpy(dist_mat)
+
+def all_pair_dist_cuda(X1, X2, feat, metric='cosine'):
+    if metric=='cosine':
+        norm1 = cp.einsum('ij, ij->i', X1, X1)
+        norm1 = cp.sqrt(norm1, norm1).reshape(-1, 1)
+
+        norm2 = cp.einsum('ij, ij->i', X2, X2)
+        norm2 = cp.sqrt(norm2, norm2).reshape(-1, 1)
+
+        return cp.dot(X2/norm2, (X1/norm1).T)
+    else:
+        n1 = len(X1)
+        n2 = len(X2)
+        nf = len(feat)
+        feat = cp.array(feat)
+        X1 = cp.array(X1.reshape(1, n1, -1))
+        X2 = cp.array(X2.reshape(1, n2, -1))
+
+        mat1 = cp.repeat(X1, n2, axis=0)
+        mat2 = cp.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
+
+        isbow = cp.repeat(cp.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
+
+        count_mat = nf - cp.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
+        zeros = (count_mat != 0)
+
+        dist_mat = cp.ones_like(count_mat)
+        dist_mat[zeros] = cp.sum(np.cbs(mat1 - mat2), axis=2)[zeros] / count_mat[zeros]
+
+        return cp.asnumpy(dist_mat)
+
+
+def all_pair_dist(X1, X2, feat, metric='cosine'):
+    if metric=='cosine':
+        return cosine_similarity(X2, X1)
+    else:
+        n1 = len(X1)
+        n2 = len(X2)
+        nf = len(feat)
+        feat = np.array(feat)
+        X1 = np.array(X1.reshape(1, n1, -1))
+        X2 = np.array(X2.reshape(1, n2, -1))
+
+        mat1 = np.repeat(X1, n2, axis=0)
+        mat2 = np.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
+
+        isbow = np.repeat(np.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
+
+        count_mat = nf - np.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
+        nonzeros = (count_mat != 0)
+
+        dist_mat = np.ones_like(count_mat)
+        dist_mat[nonzeros] = np.sum(np.abs(mat1 - mat2), axis=2)[nonzeros] / count_mat[nonzeros]
+
+        return dist_mat
+
+
 
 def marginals_to_labels(hf, beta, feat, X, hg):
     if f'{hf.__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
@@ -119,13 +176,6 @@ class HeuristicGenerator(object):
                 L[:, i] = marginals_to_labels(hf, beta_opt[i],  feat_combos[i], primitive_matrix[:, feat_combos[i]],  self)
             return L
 
-        ########using future
-        # with cf.ThreadPoolExecutor(max_workers=8) as exe:
-        #     future_to_index = {exe.submit(marginals_to_labels, i[1], primitive_matrix[:, feat_combos[i[0]]], beta_opt[i[0]], feat_combos[i[0]]): i[0]
-        #                        for i in enumerate(heuristics)}
-        #     for future in cf.as_completed(future_to_index):
-        #         i = future_to_index[future]
-        #         L[:, i] = future.result()
 
         else:
         ########using parmap

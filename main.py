@@ -125,7 +125,7 @@ def main():
 
         for c in range(1, 11):
             exp_name = f'{current_date_time}_{ht}_c{c}'
-            writer = SummaryWriter(f'tensorboard_logs/{exp_name}')
+            writer = None#SummaryWriter(f'tensorboard_logs/{exp_name}')
 
             hgs[ht] = []
             for j in range(6):
@@ -142,7 +142,7 @@ def main():
 
             for j in range(6):
                 start = time.time()
-                training_marginals.append(run_snuba(hgs[ht][j], ht, n=20, min_cardinality = c, max_cardinality = c, writer=writer, j=j))
+                training_marginals.append(run_snuba(hgs[ht][j], ht, n=1, min_cardinality = c, max_cardinality = c, writer=writer, j=j))
                 end = time.time()
                 print(f'time elapsed : {end-start}')
                 times.append(end-start)
