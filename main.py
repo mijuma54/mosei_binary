@@ -77,12 +77,12 @@ def load_data():
         glove_min = min(glove_min, np.min(r))
     glove_normal_factor = glove_max - glove_min
 
-    new_X = np.zeros((len(X), X.shape[1] + 900))
+    new_X = np.zeros((len(X), X.shape[1] + 0))
     for i in range(len(X)):
         new_X[i][:X.shape[1]] = X[i]
-        new_X[i][X.shape[1]:X.shape[1]+300] = np.mean(X2[i], axis=0)/glove_normal_factor
-        new_X[i][X.shape[1]+300:X.shape[1] + 600] = np.max(X2[i], axis=0)/glove_normal_factor
-        new_X[i][X.shape[1]+600:X.shape[1] + 900] = np.min(X2[i], axis=0)/glove_normal_factor
+        # new_X[i][X.shape[1]:X.shape[1]+300] = np.mean(X2[i], axis=0)/glove_normal_factor
+        # new_X[i][X.shape[1]+300:X.shape[1] + 600] = np.max(X2[i], axis=0)/glove_normal_factor
+        # new_X[i][X.shape[1]+600:X.shape[1] + 900] = np.min(X2[i], axis=0)/glove_normal_factor
     return np.array(new_X), np.array(y)
 
 def main():
@@ -120,11 +120,11 @@ def main():
     training_marginalss = []
     timess = []
     hgs = dict()
-    for ht in ['nn','dt', 'lr']: #
+    for ht in ['nn']: #,'dt', 'lr'
 
 
         for c in range(1, 11):
-            exp_name = f'{current_date_time}_{ht}_c{c}'
+            exp_name = f'{current_date_time}_bow_{ht}_c{c}'
             writer = None#SummaryWriter(f'tensorboard_logs/{exp_name}')
 
             hgs[ht] = []
@@ -140,9 +140,9 @@ def main():
 
             training_marginals = []
 
-            for j in range(6):
+            for j in range(1,6):
                 start = time.time()
-                training_marginals.append(run_snuba(hgs[ht][j], ht, n=1, min_cardinality = c, max_cardinality = c, writer=writer, j=j))
+                training_marginals.append(run_snuba(hgs[ht][j], ht, n=20, min_cardinality = c, max_cardinality = c, writer=writer, j=j))
                 end = time.time()
                 print(f'time elapsed : {end-start}')
                 times.append(end-start)

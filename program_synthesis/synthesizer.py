@@ -1,6 +1,6 @@
 import numpy as np
 
-from sklearn.metrics import f1_score
+#from sklearn.metrics import f1_score
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.neighbors import KNeighborsClassifier
@@ -12,11 +12,42 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 
 
+def f1_score(ground, pred):
+    ground = ground.reshape(-1)
+    pred = pred.reshape(-1)
+
+    if np.sum(pred != 0) == 0:
+        precision = 0
+    else:
+        precision = np.sum(ground == pred)/np.sum(pred != 0)
+    recall = np.sum(ground == pred)/len(ground)
+
+    if precision + recall == 0:
+        return 0
+    else:
+        return 2*precision*recall/(precision+recall)
+
+def f1_score_cuda(ground, pred):
+    ground = cp.array(ground).reshape(-1)
+    pred = cp.array(pred).reshape(-1)
+
+    if cp.sum(pred != 0) == 0:
+        precision = 0
+    else:
+        precision = cp.sum(ground == pred)/cp.sum(pred != 0)
+    recall = cp.sum(ground == pred)/len(ground)
+
+    if precision + recall == 0:
+        return 0
+    else:
+        return 2*precision*recall/(precision+recall)
+
+
 
 def random_combination(m, n, k): #m combinations from nCk
     out = []
     check = dict()
-    while len(out) < 10:#m:
+    while len(out) < 1000:#m:
         temp = np.random.choice(range(n), k, replace=False)
         if str(temp) not in check:
             out.append(np.array(temp))
@@ -26,15 +57,13 @@ def random_combination(m, n, k): #m combinations from nCk
 
 def all_pair_dist_cuda(X1, X2, feat, metric='cosine'):
     if metric=='cosine':
-        X1 = cp.array(X1)
-        X2 = cp.array(X2)
         norm1 = cp.einsum('ij, ij->i', X1, X1)
         norm1 = cp.sqrt(norm1, norm1).reshape(-1, 1)
 
         norm2 = cp.einsum('ij, ij->i', X2, X2)
         norm2 = cp.sqrt(norm2, norm2).reshape(-1, 1)
 
-        return cp.asnumpy(cp.dot(X2/norm2, (X1/norm1).T))
+        return cp.dot(X2/norm2, (X1/norm1).T)
     else:
         n1 = len(X1)
         n2 = len(X2)
@@ -86,27 +115,28 @@ def all_pair_dist(X1, X2, feat, metric='cosine'):
 class dummyKneighborClassifier(object):
     def __init__(self, n):
         self.n = n
-
+    # @profile
     def predict_proba_cuda(self, dist_mat, val_ground, metric='cosine'):
 
-        dist_mat = cp.array(dist_mat)
+
+
+        # dist_mat = cp.array(dist_mat)
         val_ground = cp.array(val_ground)
         if metric == 'cosine':
-            neigh_ground = val_ground[cp.argsort(dist_mat, axis=1)[:, :self.n]]
+            neigh = cp.argpartition(dist_mat, self.n, axis=1)[:, :self.n]
+            neigh_ground = val_ground[neigh]
 
         else:
             neigh_ground = val_ground[cp.argsort(dist_mat, axis=1)[:, -self.n:]]
 
         marginals = cp.ones((dist_mat.shape[0], 2))
         marginals[:, 1] = cp.sum(neigh_ground == 1, axis=1) / self.n
-        #marginals[:, 0] -= cp.sum(neigh_ground == 1, axis=1) / self.n
 
-
-        return cp.asnumpy(marginals)
+        return marginals[:, 1]
 
     def predict_proba(self, dist_mat, val_ground, metric='cosine'):
         if metric=='cosine':
-            neigh_ground = val_ground[np.argsort(dist_mat, axis=1)[:, :self.n]]
+            neigh_ground = val_ground[np.argpartition(dist_mat, -self.n, axis=1)[:, :self.n]]
         else:
 
 
@@ -116,7 +146,7 @@ class dummyKneighborClassifier(object):
         #marginals[:, 0] -= np.sum(neigh_ground == 1, axis=1) / self.n
 
 
-        return marginals
+        return marginals[:, 1]
 
 class Synthesizer(object):
     """
@@ -182,7 +212,7 @@ class Synthesizer(object):
     def fit_and_return(self, comb, model):
         return self.fit_function(comb, model)
 
-    #@profile
+    ## @profile
     def generate_heuristics(self, model,min_cardinality=1, max_cardinality=1):
         """
         Generates heuristics over given feature cardinality
@@ -229,22 +259,45 @@ class Synthesizer(object):
             labels_cutoff = np.zeros(np.shape(marginals))
             labels_cutoff[marginals <= (self.b - beta)] = -1.
             labels_cutoff[marginals >= (self.b + beta)] = 1.
-            f1.append(f1_score(ground, labels_cutoff, average='weighted'))
+            f1.append(f1_score(ground, labels_cutoff))
 
         f1 = np.nan_to_num(f1)
-        return beta_params[np.argsort(np.array(f1))[-1]]
+        return beta_params[np.argpartition(np.array(f1), -1)[-1]]
+
+    def beta_optimizer_cuda(self, marginals, ground):
+        """
+        Returns the best beta parameter for abstain threshold given marginals
+        Uses F1 score that maximizes the F1 score
+        marginals: confidences for data from a single heuristic
+        """
+
+        # Set the range of beta params
+        # 0.25 instead of 0.0 as a min makes controls coverage better
+        beta_params = cp.linspace(0.25, 0.45, 10)
+
+        f1 = []
+
+        for beta in beta_params:
+            labels_cutoff = cp.zeros(np.shape(marginals))
+            labels_cutoff[marginals <= (self.b - beta)] = -1.
+            labels_cutoff[marginals >= (self.b + beta)] = 1.
+            f1.append(cp.asnumpy(f1_score_cuda(ground, labels_cutoff)))
+
+
+        f1 = np.nan_to_num(f1)
+        return beta_params[np.argpartition(np.array(f1), -1)[-1]]
 
 
     def find_dist_and_proba_and_beta(self, hf, feat, X,  ground):
         X_ = all_pair_dist(self.val_primitive_matrix[:, feat], X[:, feat], feat)
-        marginals = hf.predict_proba(X_, self.val_ground)[:, 1]
+        marginals = hf.predict_proba(X_, self.val_ground)
         return self.beta_optimizer(marginals, ground)
 
     def find_proba_and_beta(self, hf, feat, X, ground):
-        marginals = hf.predict_proba(X[:, feat])[:, 1]
+        marginals = hf.predict_proba(X[:, feat])
         return self.beta_optimizer(marginals, ground)
 
-    #@profile
+    # @profile
     def find_optimal_beta(self, heuristics,  X, feat_combos, ground):
         """
         Returns optimal beta for given heuristics
@@ -259,10 +312,20 @@ class Synthesizer(object):
             ########single-core, gpu
             if self.cuda:
                 beta_opt = []
+                X_ = []
+                # for i, hf in enumerate(heuristics):
+                #     X_.append(all_pair_dist_cuda(self.val_primitive_matrix[:, feat_combos[i]], X[:, feat_combos[i]], feat_combos[i]))
+                #
+                # marginals = parmap.map(heuristics[0].predict_proba, X_, self.val_ground)
+                #
+                # for i, hf in enumerate(heuristics):
+                #     beta_opt.append((self.beta_optimizer(marginals[i], ground)))
+
                 for i, hf in enumerate(heuristics):
-                    X_ = all_pair_dist_cuda(self.val_primitive_matrix[:, feat_combos[i]], X[:, feat_combos[i]], feat_combos[i])
-                    marginals = hf.predict_proba(X_, self.val_ground)[:, 1]
-                    beta_opt.append((self.beta_optimizer(marginals, ground)))
+                    X_ = all_pair_dist_cuda(cp.array(self.val_primitive_matrix[:, feat_combos[i]]), cp.array(X[:, feat_combos[i]]), feat_combos[i])
+                    marginals = hf.predict_proba_cuda(X_, self.val_ground)
+                    beta_opt.append(self.beta_optimizer_cuda(marginals, ground))
+
             else:
                 #######with parmap
                 beta_opt = parmap.starmap(self.find_dist_and_proba_and_beta, list(zip(heuristics, feat_combos)), X, ground,

@@ -23,30 +23,10 @@ def f1_score(ground, pred):
     else:
         return 2*precision*recall/(precision+recall)
 
+
 #@profile
-def all_pair_dist_cuda(X1, X2, feat):
-    n1 = len(X1)
-    n2 = len(X2)
-    nf = len(feat)
-    feat = cp.array(feat)
-    X1 = cp.array(X1.reshape(1, n1, -1))
-    X2 = cp.array(X2.reshape(1, n2, -1))
-
-    mat1 = cp.repeat(X1, n2, axis=0)
-    mat2 = cp.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
-
-    isbow = cp.repeat(cp.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
-    count_mat = nf - cp.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
-    zeros = cp.where(count_mat == 0)
-    count_mat[zeros] = 1
-
-    dist_mat = cp.sum(np.abs(mat1 - mat2), axis=2) / count_mat
-    dist_mat[zeros] = 1
-
-    return cp.asnumpy(dist_mat)
-
-def all_pair_dist_cuda(X1, X2, feat, metric='cosine'):
-    if metric=='cosine':
+def all_pair_dist_cuda(X1, X2, feat, dist='cosine'):
+    if dist=='cosine':
         X1 = cp.array(X1)
         X2 = cp.array(X2)
         norm1 = cp.einsum('ij, ij->i', X1, X1)
@@ -55,7 +35,12 @@ def all_pair_dist_cuda(X1, X2, feat, metric='cosine'):
         norm2 = cp.einsum('ij, ij->i', X2, X2)
         norm2 = cp.sqrt(norm2, norm2).reshape(-1, 1)
 
-        return cp.asnumpy(cp.dot(X2/norm2, (X1/norm1).T))
+        X2 = X2/norm2
+        X1 = X1/norm1
+        X1 = X1.T
+
+        result = cp.dot(X2, X1)
+        return result
     else:
         n1 = len(X1)
         n2 = len(X2)
@@ -78,8 +63,8 @@ def all_pair_dist_cuda(X1, X2, feat, metric='cosine'):
         return cp.asnumpy(dist_mat)
 
 
-def all_pair_dist(X1, X2, feat, metric='cosine'):
-    if metric=='cosine':
+def all_pair_dist(X1, X2, feat, dist='cosine'):
+    if dist=='cosine':
         return cosine_similarity(X2, X1)
     else:
         n1 = len(X1)
@@ -92,9 +77,9 @@ def all_pair_dist(X1, X2, feat, metric='cosine'):
         mat1 = np.repeat(X1, n2, axis=0)
         mat2 = np.repeat(X2.reshape(n2, 1, nf), n1, axis=1)
 
-        isbow = np.repeat(np.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
+        #isbow = np.repeat(np.repeat((feat < 2100).reshape(1, 1, nf), n1, axis=1), n2, axis=0)
 
-        count_mat = nf - np.sum((mat1 == 0) & (mat2 == 0) & isbow, axis=2)
+        count_mat = nf - np.sum((mat1 == 0) & (mat2 == 0), axis=2)# & isbow, axis=2)
         nonzeros = (count_mat != 0)
 
         dist_mat = np.ones_like(count_mat)
@@ -102,14 +87,14 @@ def all_pair_dist(X1, X2, feat, metric='cosine'):
 
         return dist_mat
 
-
+#@profile
 def marginals_to_labels_cuda(hf, beta, feat, X, hg):
     if hg.feedback_idx is not None:
         X_ = all_pair_dist_cuda(hg.val_primitive_matrix[:, feat][hg.feedback_idx], X, feat)
     else:
         X_ = all_pair_dist_cuda(hg.val_primitive_matrix[:, feat], X, feat)
 
-    marginals = cp.array(hf.predict_proba(X_, hg.val_ground)[:, 1])
+    marginals =hf.predict_proba_cuda(X_, hg.val_ground)
 
     labels_cutoff = cp.zeros(np.shape(marginals))
     labels_cutoff[marginals <= (hg.b - beta)] = -1.
@@ -124,9 +109,9 @@ def marginals_to_labels(hf, beta, feat, X, hg):
             X_ = all_pair_dist(hg.val_primitive_matrix[:, feat][hg.feedback_idx], X, feat)
         else:
             X_ = all_pair_dist(hg.val_primitive_matrix[:, feat], X, feat)
-        marginals = hf.predict_proba(X_, hg.val_ground)[:, 1]
+        marginals = hf.predict_proba(X_, hg.val_ground)
     else:
-        marginals = hf.predict_proba(X)[:, 1]
+        marginals = hf.predict_proba(X)
 
     labels_cutoff = np.zeros(np.shape(marginals))
     labels_cutoff[marginals <= (hg.b - beta)] = -1.
@@ -181,6 +166,8 @@ class HeuristicGenerator(object):
                 ########using parmap
                 L_ = parmap.starmap(marginals_to_labels, list(zip(heuristics, beta_opt, feat_combos)),
                                     primitive_matrix, self, pm_pbar=True)
+
+                return np.transpose(np.array(L_))
 
         else:
         ########using parmap
@@ -240,7 +227,7 @@ class HeuristicGenerator(object):
         sort_idx = np.argsort(combined_scores)[::-1][0:keep]
         return sort_idx
 
-    #@profile
+    #profile
     def run_synthesizer(self, min_cardinality=1, max_cardinality=1, idx=None, keep=1, model='lr'):
         """
         Generates Synthesizer object and saves all generated heuristics
@@ -285,7 +272,7 @@ class HeuristicGenerator(object):
         self.L_val = self.apply_heuristics(self.hf, self.val_primitive_matrix, self.feat_combos, beta_opt)
         self.L_train = self.apply_heuristics(self.hf, self.train_primitive_matrix, self.feat_combos, beta_opt)
 
-    #@profile
+    #profile
     def run_verifier(self):
         """
         Generates Verifier object and saves marginals
