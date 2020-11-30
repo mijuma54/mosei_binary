@@ -9,8 +9,8 @@ import concurrent.futures as cf
 import parmap
 import cupy as cp
 from sklearn.metrics.pairwise import cosine_similarity
-
-
+from numba import jit
+import time
 
 def f1_score(ground, pred):
     ground = ground.reshape(-1)
@@ -47,7 +47,7 @@ def f1_score_cuda(ground, pred):
 def random_combination(m, n, k): #m combinations from nCk
     out = []
     check = dict()
-    while len(out) < 1000:#m:
+    while len(out) < 100:#m:
         temp = np.random.choice(range(n), k, replace=False)
         if str(temp) not in check:
             out.append(np.array(temp))
@@ -85,7 +85,7 @@ def all_pair_dist_cuda(X1, X2, feat, metric='cosine'):
 
         return cp.asnumpy(dist_mat)
 
-
+# @jit
 def all_pair_dist(X1, X2, feat, metric='cosine'):
     if metric=='cosine':
         return cosine_similarity(X2, X1)
@@ -133,7 +133,7 @@ class dummyKneighborClassifier(object):
         marginals[:, 1] = cp.sum(neigh_ground == 1, axis=1) / self.n
 
         return marginals[:, 1]
-
+    # @jit
     def predict_proba(self, dist_mat, val_ground, metric='cosine'):
         if metric=='cosine':
             neigh_ground = val_ground[np.argpartition(dist_mat, -self.n, axis=1)[:, :self.n]]
@@ -164,7 +164,7 @@ class Synthesizer(object):
         self.p = np.shape(self.val_primitive_matrix)[1]
         self.b = b
         self.cuda = cuda
-
+        self.betas = []
     def generate_feature_combinations(self, cardinality=1):
         """
         Create a list of primitive index combinations for given cardinality
@@ -213,6 +213,7 @@ class Synthesizer(object):
         return self.fit_function(comb, model)
 
     ## @profile
+    # @jit
     def generate_heuristics(self, model,min_cardinality=1, max_cardinality=1):
         """
         Generates heuristics over given feature cardinality
@@ -233,15 +234,18 @@ class Synthesizer(object):
 
 
 
-            #########with parmap
+            ########with parmap
             heuristics = parmap.map(self.fit_and_return, feature_combinations, model, pm_pbar=True)
+
+
+
 
 
             feature_combinations_final.append(feature_combinations)
             heuristics_final.append(heuristics)
 
         return heuristics_final, feature_combinations_final
-
+    # @jit
     def beta_optimizer(self, marginals, ground):
         """
         Returns the best beta parameter for abstain threshold given marginals
@@ -291,11 +295,13 @@ class Synthesizer(object):
     def find_dist_and_proba_and_beta(self, hf, feat, X,  ground):
         X_ = all_pair_dist(self.val_primitive_matrix[:, feat], X[:, feat], feat)
         marginals = hf.predict_proba(X_, self.val_ground)
-        return self.beta_optimizer(marginals, ground)
+        beta_opt = self.beta_optimizer(marginals, ground)
+        return beta_opt
 
     def find_proba_and_beta(self, hf, feat, X, ground):
         marginals = hf.predict_proba(X[:, feat])
-        return self.beta_optimizer(marginals, ground)
+        beta_opt = self.beta_optimizer(marginals, ground)
+        return beta_opt
 
     # @profile
     def find_optimal_beta(self, heuristics,  X, feat_combos, ground):
@@ -312,7 +318,6 @@ class Synthesizer(object):
             ########single-core, gpu
             if self.cuda:
                 beta_opt = []
-                X_ = []
                 # for i, hf in enumerate(heuristics):
                 #     X_.append(all_pair_dist_cuda(self.val_primitive_matrix[:, feat_combos[i]], X[:, feat_combos[i]], feat_combos[i]))
                 #
@@ -325,13 +330,31 @@ class Synthesizer(object):
                     X_ = all_pair_dist_cuda(cp.array(self.val_primitive_matrix[:, feat_combos[i]]), cp.array(X[:, feat_combos[i]]), feat_combos[i])
                     marginals = hf.predict_proba_cuda(X_, self.val_ground)
                     beta_opt.append(self.beta_optimizer_cuda(marginals, ground))
-
+                    self.betas.append = beta_opt[-1]
             else:
+
                 #######with parmap
-                beta_opt = parmap.starmap(self.find_dist_and_proba_and_beta, list(zip(heuristics, feat_combos)), X, ground,
-                                          pm_pbar=True)
+                # beta_opt = parmap.starmap(self.find_dist_and_proba_and_beta, list(zip(heuristics, feat_combos)), X, ground,
+                #                           pm_pbar=True)
+                # self.betas = beta_opt
+
+                #######single-core, numba
+                beta_opt = []
+                for i, hf in enumerate(heuristics):
+                    #print(i, end='\r')
+                    X_ = all_pair_dist(self.val_primitive_matrix[:, feat_combos[i]], X[:, feat_combos[i]], feat_combos[i])
+                    marginals = hf.predict_proba(X_, self.val_ground)
+                    beta_opt.append(self.beta_optimizer(marginals, ground))
+                    self.betas.append = beta_opt[-1]
         else:
             #######with parmap
             beta_opt = parmap.starmap(self.find_proba_and_beta, list(zip(heuristics, feat_combos)), X, ground, pm_pbar=True)
+            self.betas = beta_opt
+        return beta_opt
 
+
+    def load_optimal_beta(self, feat_idx):
+        beta_opt = []
+        for i in feat_idx:
+            beta_opt.append(self.betas[i])
         return beta_opt

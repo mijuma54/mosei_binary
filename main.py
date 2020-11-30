@@ -24,7 +24,7 @@ def run_snuba(hg, ht,  n = 1, idx = None, min_cardinality = 1, max_cardinality =
         if i-1:
             hg.run_synthesizer(min_cardinality=min_cardinality, max_cardinality=max_cardinality, idx=idx, keep=1, model=ht)
         else:
-            hg.run_synthesizer(min_cardinality=min_cardinality, max_cardinality=max_cardinality, idx=idx, keep=5, model=ht)
+            hg.run_synthesizer(min_cardinality=min_cardinality, max_cardinality=max_cardinality, idx=idx, keep=10, model=ht)
         hg.run_verifier()
 
 
@@ -89,13 +89,15 @@ def main():
     now = datetime.now()
     current_date_time = now.strftime("%m-%d-%Y_%H:%M:%S")
     warnings.filterwarnings("ignore")
+    num_labels = 6
+    #load data
     X, y = load_data()
 
     train_X, val_X, train_y_,  val_y_ = train_test_split(X, y, test_size=0.1, random_state=1234)
 
     train_ys = [np.zeros(len(train_y_)),np.zeros(len(train_y_)),np.zeros(len(train_y_)),np.zeros(len(train_y_)),np.zeros(len(train_y_)),np.zeros(len(train_y_))]
     val_ys = [np.zeros(len(val_y_)),np.zeros(len(val_y_)),np.zeros(len(val_y_)),np.zeros(len(val_y_)),np.zeros(len(val_y_)),np.zeros(len(val_y_))]
-    label_count = np.zeros(6)
+    label_count = np.zeros(num_labels)
 
     for i, l in enumerate(train_y_):
         for j in range(1, 7):
@@ -113,6 +115,7 @@ def main():
                 val_ys[j-1][i] = -1
 
 
+    #
     cuda = False
     precisions = []
     recalls = []
@@ -120,15 +123,14 @@ def main():
     training_marginalss = []
     timess = []
     hgs = dict()
-    for ht in ['nn']: #,'dt', 'lr'
+    for ht in ['dt', 'lr']:
 
-
-        for c in range(1, 11):
+        for c in range(5, 11):
             exp_name = f'{current_date_time}_bow_{ht}_c{c}'
-            writer = None#SummaryWriter(f'tensorboard_logs/{exp_name}')
+            writer = SummaryWriter(f'tensorboard_logs/{exp_name}')
 
             hgs[ht] = []
-            for j in range(6):
+            for j in range(num_labels):
                 hgs[ht].append(HeuristicGenerator(train_X, val_X, val_ys[j], train_ys[j], cuda=cuda))
 
 
@@ -140,9 +142,9 @@ def main():
 
             training_marginals = []
 
-            for j in range(1,6):
+            for j in range(num_labels):
                 start = time.time()
-                training_marginals.append(run_snuba(hgs[ht][j], ht, n=20, min_cardinality = c, max_cardinality = c, writer=writer, j=j))
+                training_marginals.append(run_snuba(hgs[ht][j], ht, n=25, min_cardinality = c, max_cardinality = c, writer=writer, j=j))
                 end = time.time()
                 print(f'time elapsed : {end-start}')
                 times.append(end-start)

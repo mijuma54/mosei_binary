@@ -102,21 +102,38 @@ def marginals_to_labels_cuda(hf, beta, feat, X, hg):
     return cp.asnumpy(labels_cutoff)
 
 #use feat inplace
-def marginals_to_labels(hf, beta, feat, X, hg):
-    X = X[:, feat]
-    if f'{hf.__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
-        if hg.feedback_idx is not None:
-            X_ = all_pair_dist(hg.val_primitive_matrix[:, feat][hg.feedback_idx], X, feat)
+def marginals_to_labels(hf, beta, feat, X, hg, mode=None):
+    key = mode + str(feat)#"(mode, frozenset(feat))
+    if key not in hg.marginals:
+        X = X[:, feat]
+        if f'{hf.__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
+            if hg.feedback_idx is not None:
+                X_ = all_pair_dist(hg.val_primitive_matrix[:, feat][hg.feedback_idx], X, feat)
+            else:
+                X_ = all_pair_dist(hg.val_primitive_matrix[:, feat], X, feat)
+            hg.marginals[key] = hf.predict_proba(X_, hg.val_ground)
         else:
-            X_ = all_pair_dist(hg.val_primitive_matrix[:, feat], X, feat)
-        marginals = hf.predict_proba(X_, hg.val_ground)
-    else:
-        marginals = hf.predict_proba(X)
+            hg.marginals[key] = hf.predict_proba(X)[:, 1]
 
-    labels_cutoff = np.zeros(np.shape(marginals))
-    labels_cutoff[marginals <= (hg.b - beta)] = -1.
-    labels_cutoff[marginals >= (hg.b + beta)] = 1.
+    labels_cutoff = np.zeros(np.shape(hg.marginals[key]))
+    labels_cutoff[hg.marginals[key] <= (hg.b - beta)] = -1.
+    labels_cutoff[hg.marginals[key] >= (hg.b + beta)] = 1.
     return labels_cutoff
+
+    # X = X[:, feat]
+    # if f'{hf.__class__}' == "<class 'program_synthesis.synthesizer.dummyKneighborClassifier'>":
+    #     if hg.feedback_idx is not None:
+    #         X_ = all_pair_dist(hg.val_primitive_matrix[:, feat][hg.feedback_idx], X, feat)
+    #     else:
+    #         X_ = all_pair_dist(hg.val_primitive_matrix[:, feat], X, feat)
+    #     marginals = hf.predict_proba(X_, hg.val_ground)
+    # else:
+    #     marginals = hf.predict_proba(X)[:, 1]
+    #
+    # labels_cutoff = np.zeros(np.shape(marginals))
+    # labels_cutoff[marginals <= (hg.b - beta)] = -1.
+    # labels_cutoff[marginals >= (hg.b + beta)] = 1.
+    # return labels_cutoff
 
 
 class HeuristicGenerator(object):
@@ -145,8 +162,11 @@ class HeuristicGenerator(object):
         self.hf = []
         self.feat_combos = []
         self.feedback_idx = None
+
+        self.marginals = dict()
+
     #@profile
-    def apply_heuristics(self, heuristics, primitive_matrix, feat_combos, beta_opt):
+    def apply_heuristics(self, heuristics, primitive_matrix, feat_combos, beta_opt, mode=None):
         """
         Apply given heuristics to given feature matrix X and abstain by beta
         heuristics: list of pre-trained logistic regression models
@@ -169,11 +189,25 @@ class HeuristicGenerator(object):
 
                 return np.transpose(np.array(L_))
 
+                ########single-core
+                # L = np.zeros((np.shape(primitive_matrix)[0], len(heuristics)))
+                # for i, hf in enumerate(heuristics):
+                #     L[:, i] = marginals_to_labels(hf, beta_opt[i], feat_combos[i], primitive_matrix,
+                #                                      self, mode=mode)
+            return L
+
         else:
         ########using parmap
-            L_ = parmap.starmap(marginals_to_labels, list(zip(heuristics, beta_opt, feat_combos)), primitive_matrix, self, pm_pbar=True)
+            L_ = parmap.starmap(marginals_to_labels, list(zip(heuristics, beta_opt, feat_combos)), primitive_matrix, self, mode=mode, pm_pbar=True)
 
             return np.transpose(np.array(L_))
+
+            ######single_core
+            # L = np.zeros((np.shape(primitive_matrix)[0], len(heuristics)))
+            # for i, hf in enumerate(heuristics):
+            #     L[:, i] = marginals_to_labels(hf, beta_opt[i], feat_combos[i], primitive_matrix,
+            #                                        self)
+            # return L
 
     #@profile
     def prune_heuristics(self, heuristics, feat_combos, keep=1):
@@ -197,9 +231,9 @@ class HeuristicGenerator(object):
             # Note that the LFs are being applied to the entire val set though they were developed on a subset...
             beta_opt_temp = self.syn.find_optimal_beta(heuristics[i], self.val_primitive_matrix, feat_combos[i],
                                                        self.val_ground)
-            L_temp_val = self.apply_heuristics(heuristics[i], self.val_primitive_matrix, feat_combos[i], beta_opt_temp)
+            L_temp_val = self.apply_heuristics(heuristics[i], self.val_primitive_matrix, feat_combos[i], beta_opt_temp, mode='val')
             L_temp_train = self.apply_heuristics(heuristics[i], self.train_primitive_matrix, feat_combos[i],
-                                                 beta_opt_temp)
+                                                 beta_opt_temp, mode='train')
 
             beta_opt = np.append(beta_opt, beta_opt_temp)
             if i == 0:
@@ -243,6 +277,8 @@ class HeuristicGenerator(object):
             primitive_matrix = self.val_primitive_matrix[idx, :]
             ground = self.val_ground[idx]
         self.idx = idx
+        #free memory
+        self.mariginals = dict()
         # Generate all possible heuristics
         self.syn = Synthesizer(primitive_matrix, ground, b=self.b, cuda=self.cuda)
 
@@ -268,9 +304,15 @@ class HeuristicGenerator(object):
             self.feat_combos.append(index(feat_combos, i))
 
         # create appended L matrices for validation and train set
-        beta_opt = self.syn.find_optimal_beta(self.hf, self.val_primitive_matrix, self.feat_combos, self.val_ground)
-        self.L_val = self.apply_heuristics(self.hf, self.val_primitive_matrix, self.feat_combos, beta_opt)
-        self.L_train = self.apply_heuristics(self.hf, self.train_primitive_matrix, self.feat_combos, beta_opt)
+        # beta_opt = self.syn.find_optimal_beta(self.hf, self.val_primitive_matrix, self.feat_combos, self.val_ground)
+        # self.L_val = self.apply_heuristics(self.hf, self.val_primitive_matrix, self.feat_combos, beta_opt, mode='val')
+        # self.L_train = self.apply_heuristics(self.hf, self.train_primitive_matrix, self.feat_combos, beta_opt, mode='train')
+
+        # load version
+        beta_opt = self.syn.load_optimal_beta(sort_idx)
+        self.L_val = self.apply_heuristics(self.hf, self.val_primitive_matrix, self.feat_combos, beta_opt, mode='val')
+        self.L_train = self.apply_heuristics(self.hf, self.train_primitive_matrix, self.feat_combos, beta_opt, mode='train')
+
 
     #profile
     def run_verifier(self):
